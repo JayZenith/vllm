@@ -26,6 +26,7 @@ class TopKTopPSampler(nn.Module):
     def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs") -> None:
         super().__init__()
         self.logprobs_mode = logprobs_mode
+        self._cuda_stream_pool: list[torch.cuda.Stream] = []
         # flashinfer optimization does not apply if intermediate
         # logprobs/logits after top_k/top_p need to be returned
         if (
@@ -89,6 +90,12 @@ class TopKTopPSampler(nn.Module):
 
         self.apply_top_k_top_p = apply_top_k_top_p
 
+    def _get_cuda_streams(self, n: int) -> list[torch.cuda.Stream]:
+        """lazily allocate and reuse CUDA streams."""
+        while len(self._cuda_stream_pool) < n:
+            self._cuda_stream_pool.append(torch.cuda.Stream())
+        return self._cuda_stream_pool[:n]
+
     def forward_native(
         self,
         logits: torch.Tensor,
@@ -108,7 +115,13 @@ class TopKTopPSampler(nn.Module):
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators), logits_to_return
+
+        # Get CUDA streams for concurrent generator sampling
+        cuda_streams = None
+        if generators and len(generators) >= 4 and logits.is_cuda:
+            cuda_streams = self._get_cuda_streams(len(generators))
+
+        return random_sample(probs, generators, cuda_streams), logits_to_return
 
     def forward_cuda(
         self,
@@ -311,11 +324,15 @@ def apply_top_k_only(
 def random_sample(
     probs: torch.Tensor,
     generators: dict[int, torch.Generator],
+    cuda_streams: list[torch.cuda.Stream] | None = None,
 ) -> torch.Tensor:
     """Randomly sample from the probabilities.
 
     We use this function instead of torch.multinomial because torch.multinomial
     causes CPU-GPU synchronization.
+
+    When multiple generators are provided, CUDA streams are used to run the
+    exponential sampling concurrently rather than sequentially.
     """
     q = torch.empty_like(probs)
     # NOTE(woosuk): To batch-process the requests without their own seeds,
@@ -325,10 +342,27 @@ def random_sample(
     if len(generators) != probs.shape[0]:
         q.exponential_()
     if generators:
-        # TODO(woosuk): This can be slow because we handle each request
-        # one by one. Optimize this.
-        for i, generator in generators.items():
-            q[i].exponential_(generator=generator)
+        # Use concurrent CUDA streams when we have enough generators
+        # to justify the overhead (threshold of 4 is empirically chosen)
+        use_streams = (
+            cuda_streams is not None and len(generators) >= 4 and probs.is_cuda
+        )
+
+        if use_streams:
+            # Run each exponential sampling on its own stream (concurrent)
+            assert cuda_streams is not None
+            for (i, generator), stream in zip(generators.items(), cuda_streams):
+                with torch.cuda.stream(stream):
+                    q[i].exponential_(generator=generator)
+            # Wait for all streams to finish before continuing
+            current_stream = torch.cuda.current_stream()
+            for stream in cuda_streams[: len(generators)]:
+                current_stream.wait_stream(stream)
+        else:
+            # Original sequential path for small number of generators
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
+
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
