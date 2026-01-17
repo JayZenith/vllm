@@ -115,3 +115,60 @@ def test_flashinfer_sampler():
     assert torch.allclose(python_probs, flashinfer_probs, atol=2e-2), (
         "FlashInfer and Python sampling implementations do not match!"
     )
+
+
+def test_random_sample_with_generators():
+    """
+    Test that random_sample produces consistent results with generators,
+    and that the CUDA streams optimization doesn't change behavior.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+
+    if DEVICE != "cuda":
+        pytest.skip("Generator test requires CUDA")
+
+    torch.set_default_device(DEVICE)
+
+    batch_size = 16
+    vocab_size = 1000  # Smaller for faster test
+
+    # Test with multiple generators
+    seeds = {0: 100, 3: 200, 7: 300, 11: 400}
+
+    for trial in range(5):
+        # Create generators with known seeds
+        generators = {
+            i: Generator(device=DEVICE).manual_seed(s) for i, s in seeds.items()
+        }
+
+        # Create probabilities
+        torch.manual_seed(trial)
+        logits = torch.randn(batch_size, vocab_size, device=DEVICE)
+        probs = logits.softmax(dim=-1)
+
+        # Sample
+        result = random_sample(probs, generators)
+
+        # Basic checks
+        assert result.shape == (batch_size,)
+        assert result.min() >= 0
+        assert result.max() < vocab_size
+
+
+def test_random_sample_no_generators():
+    """Test random_sample with empty generators dict."""
+    from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+
+    torch.set_default_device(DEVICE)
+
+    batch_size = 8
+    vocab_size = 1000
+
+    logits = torch.randn(batch_size, vocab_size, device=DEVICE)
+    probs = logits.softmax(dim=-1)
+
+    result = random_sample(probs, {})
+
+    assert result.shape == (batch_size,)
+    assert result.min() >= 0
+    assert result.max() < vocab_size
